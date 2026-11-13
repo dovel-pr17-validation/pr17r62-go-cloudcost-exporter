@@ -1,0 +1,57 @@
+// Package utils contains shared helpers for metric construction and constants.
+package utils
+
+import (
+	"maps"
+	"slices"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	// DefaultScrapeInterval is the default scrape interval for the collectors.
+	DefaultScrapeInterval = 1 * time.Hour
+	// HoursInMonth is an approximate average number of hours in a month.
+	// 24.35 is the average number of hours per day over a year.
+	HoursInMonth = 24.35 * 30
+	// InstanceCPUCostSuffix is the suffix for per-core-hour CPU cost metrics.
+	InstanceCPUCostSuffix = "instance_cpu_usd_per_core_hour"
+	// InstanceMemoryCostSuffix is the suffix for per-GiB-hour memory cost metrics.
+	InstanceMemoryCostSuffix = "instance_memory_usd_per_gib_hour"
+	// InstanceGPUCostSuffix is the suffix for per-GPU-hour GPU cost metrics.
+	InstanceGPUCostSuffix = "instance_gpu_usd_per_gpu_hour"
+	// InstanceTotalCostSuffix is the suffix for total per-hour instance cost metrics.
+	InstanceTotalCostSuffix = "instance_total_usd_per_hour"
+	// PersistentVolumeCostSuffix is the suffix for per-hour EBS volume cost metrics.
+	PersistentVolumeCostSuffix = "persistent_volume_usd_per_hour"
+	// Used for Azure persistent volumes following AWS naming pattern.
+	PersistentVolumeCostPerGiBSuffix = "persistent_volume_usd_per_gib_hour"
+	// RegionUnknown is used as a label value when a region or other attribute cannot be determined.
+	RegionUnknown = "unknown"
+	// TokenCostSuffix is the suffix for per-1k-token cost metrics that carry a token_type label
+	// (input, output, and prompt-cache read/write) instead of encoding direction in the name.
+	TokenCostSuffix = "usd_per_1k_tokens"
+	// CharacterCostSuffix is the suffix for per-1k-character cost metrics that carry a token_type
+	// label (input, output) instead of encoding direction in the name. Used for models billed per
+	// character rather than per token (e.g. translation models).
+	CharacterCostSuffix = "usd_per_1k_characters"
+	// SearchUnitCostSuffix is the suffix for per-1k-search-unit cost metrics (e.g. Cohere Rerank).
+	SearchUnitCostSuffix = "search_unit_usd_per_1k_search_units"
+)
+
+// RegionsFromMap returns the keys of a map as a slice of strings.
+// Used by collectors that store per-region clients in a map[string]Client.
+func RegionsFromMap[V any](m map[string]V) []string {
+	return slices.Collect(maps.Keys(m))
+}
+
+// GenerateDesc creates a Prometheus metric descriptor with a standardized fqname.
+func GenerateDesc(prefix, subsystem, suffix, description string, labels []string) *prometheus.Desc {
+	return prometheus.NewDesc(
+		prometheus.BuildFQName(prefix, subsystem, suffix),
+		description,
+		labels,
+		nil,
+	)
+}

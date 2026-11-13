@@ -1,0 +1,473 @@
+package ec2
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/grafana/cloudcost-exporter/pkg/aws/client"
+	"github.com/grafana/cloudcost-exporter/pkg/utils"
+
+	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/prometheus/client_golang/prometheus"
+
+	cloudcostexporter "github.com/grafana/cloudcost-exporter"
+	"github.com/grafana/cloudcost-exporter/pkg/provider"
+)
+
+const (
+	subsystem = "aws_ec2"
+
+	errGroupLimit        = 5
+	maxConcurrentWorkers = 5
+)
+
+var (
+	ErrGeneratePricingMap = errors.New("error generating pricing map")
+	ErrClientNotFound     = errors.New("no client found")
+)
+
+var (
+	InstanceCPUHourlyCostDesc = utils.GenerateDesc(
+		cloudcostexporter.MetricPrefix,
+		subsystem,
+		utils.InstanceCPUCostSuffix,
+		"The cpu cost a ec2 instance in USD/(core*h)",
+		[]string{"account_id", "instance", "instance_id", "region", "family", "machine_type", "cluster_name", "price_tier", "architecture"},
+	)
+	InstanceMemoryHourlyCostDesc = utils.GenerateDesc(
+		cloudcostexporter.MetricPrefix,
+		subsystem,
+		utils.InstanceMemoryCostSuffix,
+		"The memory cost of a ec2 instance in USD/(GiB*h)",
+		[]string{"account_id", "instance", "instance_id", "region", "family", "machine_type", "cluster_name", "price_tier", "architecture"},
+	)
+	InstanceGPUHourlyCostDesc = utils.GenerateDesc(
+		cloudcostexporter.MetricPrefix,
+		subsystem,
+		utils.InstanceGPUCostSuffix,
+		"The gpu cost of a ec2 instance in USD/(gpu*h)",
+		[]string{"account_id", "instance", "instance_id", "region", "family", "machine_type", "cluster_name", "price_tier", "architecture"},
+	)
+	InstanceTotalHourlyCostDesc = utils.GenerateDesc(
+		cloudcostexporter.MetricPrefix,
+		subsystem,
+		utils.InstanceTotalCostSuffix,
+		"The total cost of the ec2 instance in USD/h",
+		[]string{"account_id", "instance", "instance_id", "region", "family", "machine_type", "cluster_name", "price_tier", "architecture"},
+	)
+	PersistentVolumeHourlyCostDesc = utils.GenerateDesc(
+		cloudcostexporter.MetricPrefix,
+		subsystem,
+		utils.PersistentVolumeCostSuffix,
+		"The cost of an AWS EBS Volume in USD/h.",
+		[]string{"account_id", "persistentvolume", "region", "availability_zone", "disk", "type", "size_gib", "state"},
+	)
+)
+
+// Collector is a prometheus collector that collects metrics from AWS EKS clusters.
+type Collector struct {
+	regions                 []ec2Types.Region
+	ScrapeInterval          time.Duration
+	computePricingMap       *ComputePricingMap
+	storagePricingMap       *StoragePricingMap
+	capacityBlockPricingMap *CapacityBlockPricingMap // nil when capacity blocks are disabled
+	awsRegionClientMap      map[string]client.Client
+	logger                  *slog.Logger
+	accountID               string
+}
+
+type Config struct {
+	ScrapeInterval        time.Duration
+	Regions               []ec2Types.Region
+	RegionMap             map[string]client.Client
+	AccountID             string
+	CapacityBlocksEnabled bool
+}
+
+// New creates an ec2 collector
+func New(ctx context.Context, config *Config, logger *slog.Logger) (*Collector, error) {
+	logger = logger.With("collector", "ec2")
+	computeMap := NewComputePricingMap(logger, config)
+	storageMap := NewStoragePricingMap(logger, config)
+
+	// Initial population so that Collect can use the maps
+	if err := computeMap.GenerateComputePricingMap(ctx); err != nil {
+		return nil, fmt.Errorf("failed initial compute pricing: %w", err)
+	}
+	if err := storageMap.GenerateStoragePricingMap(ctx); err != nil {
+		return nil, fmt.Errorf("failed initial storage pricing: %w", err)
+	}
+
+	go func() {
+		computeTicker := time.NewTicker(config.ScrapeInterval)
+		defer computeTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-computeTicker.C:
+				if err := computeMap.GenerateComputePricingMap(ctx); err != nil {
+					logger.Error("failed to refresh compute pricing map", "error", err)
+				}
+			}
+		}
+	}()
+	go func() {
+		storageTicker := time.NewTicker(config.ScrapeInterval)
+		defer storageTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-storageTicker.C:
+				if err := storageMap.GenerateStoragePricingMap(ctx); err != nil {
+					logger.Error("failed to refresh storage pricing map", "error", err)
+				}
+			}
+		}
+	}()
+
+	// Capacity block pricing is opt-in: it adds Cost Explorer calls and only
+	// applies to accounts that purchase Capacity Blocks. Init failures are
+	// non-fatal so a Cost Explorer hiccup (e.g. missing ce:GetCostAndUsage)
+	// never takes down on-demand/spot/EBS pricing.
+	var capacityBlockMap *CapacityBlockPricingMap
+	if config.CapacityBlocksEnabled {
+		capacityBlockMap = NewCapacityBlockPricingMap(logger, config)
+		if err := capacityBlockMap.GenerateCapacityBlockPricingMap(ctx); err != nil {
+			logger.Error("failed initial capacity block pricing", "error", err)
+		}
+		go func() {
+			capacityBlockTicker := time.NewTicker(config.ScrapeInterval)
+			defer capacityBlockTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-capacityBlockTicker.C:
+					if err := capacityBlockMap.GenerateCapacityBlockPricingMap(ctx); err != nil {
+						logger.Error("failed to refresh capacity block pricing map", "error", err)
+					}
+				}
+			}
+		}()
+	}
+
+	return &Collector{
+		ScrapeInterval:          config.ScrapeInterval,
+		regions:                 config.Regions,
+		logger:                  logger,
+		awsRegionClientMap:      config.RegionMap,
+		computePricingMap:       computeMap,
+		storagePricingMap:       storageMap,
+		capacityBlockPricingMap: capacityBlockMap,
+		accountID:               config.AccountID,
+	}, nil
+}
+
+// Collect satisfies the provider.Collector interface.
+func (c *Collector) Collect(ctx context.Context, ch chan<- prometheus.Metric) error {
+	c.logger.LogAttrs(ctx, slog.LevelInfo, "calling collect")
+
+	numOfRegions := len(c.regions)
+
+	wgInstances := sync.WaitGroup{}
+	wgInstances.Add(numOfRegions)
+	instanceCh := make(chan []ec2Types.Reservation, numOfRegions)
+
+	wgVolumes := sync.WaitGroup{}
+	wgVolumes.Add(numOfRegions)
+	volumeCh := make(chan []ec2Types.Volume, numOfRegions)
+
+	for _, region := range c.regions {
+		regionName := *region.RegionName
+
+		regionClient, ok := c.awsRegionClientMap[regionName]
+		if !ok {
+			return ErrClientNotFound
+		}
+
+		go func() {
+			c.fetchInstancesData(ctx, regionClient, regionName, instanceCh)
+			wgInstances.Done()
+		}()
+		go func() {
+			c.fetchVolumesData(ctx, regionClient, regionName, volumeCh)
+			wgVolumes.Done()
+		}()
+	}
+	go func() {
+		wgInstances.Wait()
+		close(instanceCh)
+	}()
+	go func() {
+		wgVolumes.Wait()
+		close(volumeCh)
+	}()
+	c.emitMetricsFromReservationsChannel(instanceCh, ch)
+	c.emitMetricsFromVolumesChannel(volumeCh, ch)
+	return nil
+}
+
+func (c *Collector) fetchInstancesData(ctx context.Context, regionClient client.Client, region string, instanceCh chan []ec2Types.Reservation) {
+	now := time.Now()
+	c.logger.LogAttrs(ctx, slog.LevelInfo, "Fetching instances", slog.String("region", region))
+
+	reservations, err := regionClient.ListComputeInstances(ctx)
+	if err != nil {
+		c.logger.LogAttrs(ctx, slog.LevelError, "Could not list compute instances",
+			slog.String("region", region),
+			slog.String("message", err.Error()))
+		return
+	}
+
+	c.logger.LogAttrs(ctx, slog.LevelInfo, "Successfully listed instances",
+		slog.String("region", region),
+		slog.Int("instances", len(reservations)),
+		slog.Duration("duration", time.Since(now)),
+	)
+
+	instanceCh <- reservations
+}
+
+func (c *Collector) fetchVolumesData(ctx context.Context, regionClient client.Client, region string, volumeCh chan []ec2Types.Volume) {
+	now := time.Now()
+	c.logger.LogAttrs(ctx, slog.LevelInfo, "Fetching volumes", slog.String("region", region))
+
+	volumes, err := regionClient.ListEBSVolumes(ctx)
+	if err != nil {
+		c.logger.LogAttrs(ctx, slog.LevelError, "Could not list EBS volumes",
+			slog.String("region", region),
+			slog.String("message", err.Error()))
+		return
+	}
+
+	c.logger.LogAttrs(ctx, slog.LevelInfo, "Successfully listed volumes",
+		slog.String("region", region),
+		slog.Int("volumes", len(volumes)),
+		slog.Duration("duration", time.Since(now)),
+	)
+
+	volumeCh <- volumes
+}
+
+func (c *Collector) emitMetricsFromReservationsChannel(reservationsCh chan []ec2Types.Reservation, ch chan<- prometheus.Metric) {
+	var allInstances []ec2Types.Instance
+	for reservations := range reservationsCh {
+		for _, reservation := range reservations {
+			allInstances = append(allInstances, reservation.Instances...)
+		}
+	}
+
+	// Process instances in parallel with limited concurrency
+	instanceChan := make(chan ec2Types.Instance, len(allInstances))
+	for _, instance := range allInstances {
+		instanceChan <- instance
+	}
+	close(instanceChan)
+
+	// Limit concurrent instance processing
+	workers := maxConcurrentWorkers
+	if len(allInstances) < workers {
+		workers = len(allInstances)
+	}
+
+	instanceWaitGroup := sync.WaitGroup{}
+	for i := 0; i < workers; i++ {
+		instanceWaitGroup.Add(1)
+		go func() {
+			defer instanceWaitGroup.Done()
+			for instance := range instanceChan {
+				c.processInstance(instance, ch)
+			}
+		}()
+	}
+	instanceWaitGroup.Wait()
+}
+
+// processInstance processes a single instance and emits its metrics
+func (c *Collector) processInstance(instance ec2Types.Instance, ch chan<- prometheus.Metric) {
+	clusterName := client.ClusterNameFromInstance(instance)
+	if instance.PrivateDnsName == nil || *instance.PrivateDnsName == "" {
+		c.logger.Debug(fmt.Sprintf("no private dns name found for instance %s", *instance.InstanceId))
+		return
+	}
+	if instance.Placement == nil || instance.Placement.AvailabilityZone == nil {
+		c.logger.Debug(fmt.Sprintf("no availability zone found for instance %s", *instance.InstanceId))
+		return
+	}
+
+	region := *instance.Placement.AvailabilityZone
+
+	var pricetier string
+	var price *Prices
+	var err error
+	switch instance.InstanceLifecycle {
+	case ec2Types.InstanceLifecycleTypeSpot:
+		// Spot prices are keyed by availability zone.
+		pricetier = "spot"
+		price, err = c.computePricingMap.GetPriceForInstanceType(region, string(instance.InstanceType))
+	case ec2Types.InstanceLifecycleTypeCapacityBlock:
+		// Capacity block prices are per reservation; match the instance to its
+		// reservation by ID. The region is only used for the metric label.
+		pricetier = "capacityblock"
+		region = region[:len(region)-1]
+		if instance.CapacityReservationId == nil {
+			c.logger.Debug(fmt.Sprintf("capacity block instance %s has no reservation id, skipping", *instance.InstanceId))
+			return
+		}
+		price, err = c.capacityBlockPrice(*instance.CapacityReservationId, string(instance.InstanceType))
+	default:
+		// On-demand prices are keyed by region, so remove the availability zone.
+		pricetier = "ondemand"
+		region = region[:len(region)-1]
+		price, err = c.computePricingMap.GetPriceForInstanceType(region, string(instance.InstanceType))
+	}
+	if err != nil {
+		c.logger.Error(fmt.Sprintf("error getting price for instance type %s: %s", instance.InstanceType, err))
+		return
+	}
+
+	labelValues := []string{
+		c.accountID,
+		*instance.PrivateDnsName,
+		*instance.InstanceId,
+		region,
+		c.computePricingMap.GetInstanceFamily(string(instance.InstanceType)),
+		string(instance.InstanceType),
+		clusterName,
+		pricetier,
+		string(instance.Architecture),
+	}
+
+	ch <- prometheus.MustNewConstMetric(InstanceCPUHourlyCostDesc, prometheus.GaugeValue, price.Cpu, labelValues...)
+	ch <- prometheus.MustNewConstMetric(InstanceMemoryHourlyCostDesc, prometheus.GaugeValue, price.Ram, labelValues...)
+	ch <- prometheus.MustNewConstMetric(InstanceTotalHourlyCostDesc, prometheus.GaugeValue, price.Total, labelValues...)
+	// Only GPU instances carry a GPU rate; emit it to avoid zero-valued series for
+	// the vast majority of instance types that have no accelerators.
+	if price.Gpu > 0 {
+		ch <- prometheus.MustNewConstMetric(InstanceGPUHourlyCostDesc, prometheus.GaugeValue, price.Gpu, labelValues...)
+	}
+}
+
+// capacityBlockPrice returns the amortized price of a Capacity Block instance,
+// weighting the per-instance-hour total into GPU, CPU and RAM with the same ratio
+// model as on-demand/spot so the per-gpu/per-core/per-GiB metrics the bottom-up
+// cost model consumes are populated. Capacity blocks are GPU instances, so the
+// GPU share carries most of the cost. If instance attributes are unavailable (no
+// on-demand price to source vCPU/memory from), the total is still emitted with
+// zero GPU/CPU/RAM split rather than dropping the instance.
+func (c *Collector) capacityBlockPrice(reservationID, instanceType string) (*Prices, error) {
+	if c.capacityBlockPricingMap == nil {
+		return nil, ErrCapacityBlockPriceNotFound
+	}
+	total, err := c.capacityBlockPricingMap.GetPriceForReservation(reservationID)
+	if err != nil {
+		return nil, err
+	}
+	attributes, ok := c.computePricingMap.GetInstanceAttributes(instanceType)
+	if !ok {
+		c.logger.Debug(fmt.Sprintf("no instance attributes for %s, emitting capacity block total only", instanceType))
+		return &Prices{Total: total}, nil
+	}
+	weighted, err := weightedPriceForInstance(total, attributes)
+	if err != nil {
+		c.logger.Debug(fmt.Sprintf("could not weight capacity block price for %s: %s", instanceType, err))
+		return &Prices{Total: total}, nil
+	}
+	return &Prices{Cpu: weighted.Cpu, Gpu: weighted.Gpu, Ram: weighted.Ram, Total: total}, nil
+}
+
+func (c *Collector) emitMetricsFromVolumesChannel(volumesCh chan []ec2Types.Volume, ch chan<- prometheus.Metric) {
+	var allVolumes []ec2Types.Volume
+	for volumes := range volumesCh {
+		allVolumes = append(allVolumes, volumes...)
+	}
+
+	// Process volumes in parallel with limited concurrency
+	volumeChan := make(chan ec2Types.Volume, len(allVolumes))
+	for _, volume := range allVolumes {
+		volumeChan <- volume
+	}
+	close(volumeChan)
+
+	// Limit concurrent volume processing
+	workers := maxConcurrentWorkers
+	if len(allVolumes) < workers {
+		workers = len(allVolumes)
+	}
+
+	volumeWaitGroup := sync.WaitGroup{}
+	for i := 0; i < workers; i++ {
+		volumeWaitGroup.Add(1)
+		go func() {
+			defer volumeWaitGroup.Done()
+			for volume := range volumeChan {
+				c.processVolume(volume, ch)
+			}
+		}()
+	}
+	volumeWaitGroup.Wait()
+}
+
+// processVolume processes a single volume and emits its metrics
+func (c *Collector) processVolume(volume ec2Types.Volume, ch chan<- prometheus.Metric) {
+	if volume.AvailabilityZone == nil {
+		c.logger.Error("Volume's Availability Zone unknown: skipping")
+		return
+	}
+
+	az := *volume.AvailabilityZone
+	// Might not be accurate every case, but it's not worth another API call to get the exact region of an AZ
+	region := az[0 : len(az)-1]
+
+	if volume.Size == nil {
+		c.logger.Error("Volume's size unknown: skipping")
+		return
+	}
+
+	price, err := c.storagePricingMap.GetPriceForVolumeType(region, string(volume.VolumeType), *volume.Size)
+	if err != nil {
+		c.logger.Error(fmt.Sprintf("error getting price for volume type %s in region %s: %s", volume.VolumeType, region, err))
+		return
+	}
+
+	labelValues := []string{
+		c.accountID,
+		client.NameFromVolume(volume),
+		region,
+		az,
+		*volume.VolumeId,
+		string(volume.VolumeType),
+		strconv.FormatInt(int64(*volume.Size), 10),
+		string(volume.State),
+	}
+
+	ch <- prometheus.MustNewConstMetric(PersistentVolumeHourlyCostDesc, prometheus.GaugeValue, price, labelValues...)
+}
+
+func (c *Collector) Describe(ch chan<- *prometheus.Desc) error {
+	ch <- InstanceCPUHourlyCostDesc
+	ch <- InstanceMemoryHourlyCostDesc
+	ch <- InstanceGPUHourlyCostDesc
+	ch <- InstanceTotalHourlyCostDesc
+	ch <- PersistentVolumeHourlyCostDesc
+	return nil
+}
+
+func (c *Collector) Name() string {
+	return subsystem
+}
+
+func (c *Collector) Regions() []string {
+	return utils.RegionsFromMap(c.awsRegionClientMap)
+}
+
+func (c *Collector) Register(_ provider.Registry) error {
+	return nil
+}

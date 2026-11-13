@@ -1,0 +1,6 @@
+# GCP CloudSQL Metrics
+
+| Metric name                                    | Metric type | Description                                                                                 | Labels                                                                                                                                                                                                                                                                    |
+|------------------------------------------------|-------------|---------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| cloudcost_gcp_cloudsql_cost_usd_per_hour      | Gauge       | Hourly cost of GCP CloudSQL instances by project, instance name and region. Cost represented in USD/hour | `project`=&lt;GCP project that owns the instance&gt; <br/> `instance`=&lt;CloudSQL instance connection name&gt; <br/> `region`=&lt;GCP region where the instance is located&gt; |
+

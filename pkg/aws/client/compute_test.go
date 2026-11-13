@@ -1,0 +1,469 @@
+package client
+
+import (
+	"context"
+	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/grafana/cloudcost-exporter/pkg/aws/services/mocks"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+)
+
+func hasAZFilter(filters []types.Filter, az string) bool {
+	for _, f := range filters {
+		if f.Name != nil && *f.Name == "availability-zone" {
+			for _, v := range f.Values {
+				if v == az {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func TestListComputeInstances(t *testing.T) {
+	tests := map[string]struct {
+		ctx                       context.Context
+		DescribeInstances         func(ctx context.Context, e *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
+		DescribeAvailabilityZones func(ctx context.Context, input *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error)
+		err                       error
+		want                      []types.Reservation
+		expectedCalls             int
+	}{
+		"No instance should return nothing": {
+			ctx: t.Context(),
+			DescribeInstances: func(ctx context.Context, e *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+				return &ec2.DescribeInstancesOutput{}, nil
+			},
+			DescribeAvailabilityZones: func(ctx context.Context, input *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
+				return &ec2.DescribeAvailabilityZonesOutput{
+					AvailabilityZones: []types.AvailabilityZone{
+						{ZoneName: aws.String("us-east-1a")},
+						{ZoneName: aws.String("us-east-1b")},
+					},
+				}, nil
+			},
+			err:           nil,
+			want:          nil,
+			expectedCalls: 2,
+		},
+		"Single instance should return a single instance": {
+			ctx: t.Context(),
+			DescribeInstances: func(ctx context.Context, e *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+				// Check which AZ filter is applied and return appropriate instances
+				if hasAZFilter(e.Filters, "us-east-1a") {
+					return &ec2.DescribeInstancesOutput{
+						Reservations: []types.Reservation{
+							{
+								Instances: []types.Instance{
+									{
+										InstanceId:   aws.String("i-1234567890abcdef0"),
+										InstanceType: types.InstanceTypeA1Xlarge,
+									},
+								},
+							},
+						},
+					}, nil
+				}
+				// Return empty for us-east-1b
+				return &ec2.DescribeInstancesOutput{}, nil
+			},
+			DescribeAvailabilityZones: func(ctx context.Context, input *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
+				return &ec2.DescribeAvailabilityZonesOutput{
+					AvailabilityZones: []types.AvailabilityZone{
+						{ZoneName: aws.String("us-east-1a")},
+						{ZoneName: aws.String("us-east-1b")},
+					},
+				}, nil
+			},
+			err: nil,
+			want: []types.Reservation{
+				{
+					Instances: []types.Instance{
+						{
+							InstanceId:   aws.String("i-1234567890abcdef0"),
+							InstanceType: types.InstanceTypeA1Xlarge,
+						},
+					},
+				},
+			},
+			expectedCalls: 2,
+		},
+		"Ensure errors propagate": {
+			ctx: t.Context(),
+			DescribeInstances: func(ctx context.Context, e *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+				// Return error for any AZ
+				return nil, assert.AnError
+			},
+			DescribeAvailabilityZones: func(ctx context.Context, input *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
+				return &ec2.DescribeAvailabilityZonesOutput{
+					AvailabilityZones: []types.AvailabilityZone{
+						{ZoneName: aws.String("us-east-1a")},
+					},
+				}, nil
+			},
+			err:           assert.AnError,
+			want:          nil,
+			expectedCalls: 1,
+		},
+		"NextToken should return multiple instances": {
+			ctx: t.Context(),
+			DescribeInstances: func(ctx context.Context, e *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+				// Check which AZ filter is applied
+				if hasAZFilter(e.Filters, "us-east-1a") {
+					// For us-east-1a, return instances with pagination
+					if e.NextToken == nil {
+						return &ec2.DescribeInstancesOutput{
+							NextToken: aws.String("token"),
+							Reservations: []types.Reservation{
+								{
+									Instances: []types.Instance{
+										{
+											InstanceId:   aws.String("i-1234567890abcdef0"),
+											InstanceType: types.InstanceTypeA1Xlarge,
+										},
+									},
+								},
+							},
+						}, nil
+					}
+					return &ec2.DescribeInstancesOutput{
+						Reservations: []types.Reservation{
+							{
+								Instances: []types.Instance{
+									{
+										InstanceId:   aws.String("i-1234567890abcdef1"),
+										InstanceType: types.InstanceTypeA1Xlarge,
+									},
+								},
+							},
+						},
+					}, nil
+				}
+				// Return empty for us-east-1b
+				return &ec2.DescribeInstancesOutput{}, nil
+			},
+			DescribeAvailabilityZones: func(ctx context.Context, input *ec2.DescribeAvailabilityZonesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
+				return &ec2.DescribeAvailabilityZonesOutput{
+					AvailabilityZones: []types.AvailabilityZone{
+						{ZoneName: aws.String("us-east-1a")},
+						{ZoneName: aws.String("us-east-1b")},
+					},
+				}, nil
+			},
+
+			err: nil,
+			want: []types.Reservation{
+				{
+					Instances: []types.Instance{
+						{
+							InstanceId:   aws.String("i-1234567890abcdef0"),
+							InstanceType: types.InstanceTypeA1Xlarge,
+						},
+					},
+				},
+				{
+					Instances: []types.Instance{
+						{
+							InstanceId:   aws.String("i-1234567890abcdef1"),
+							InstanceType: types.InstanceTypeA1Xlarge,
+						},
+					},
+				},
+			},
+			expectedCalls: 3,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			client := mocks.NewMockEC2(ctrl)
+
+			// Mock DescribeAvailabilityZones call
+			if tt.DescribeAvailabilityZones != nil {
+				client.EXPECT().
+					DescribeAvailabilityZones(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(tt.DescribeAvailabilityZones).
+					Times(1)
+			}
+
+			// Mock DescribeInstances calls
+			client.EXPECT().
+				DescribeInstances(gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(tt.DescribeInstances).
+				Times(tt.expectedCalls)
+
+			c := newCompute(client)
+			got, err := c.listComputeInstances(tt.ctx)
+			assert.Equal(t, tt.err, err)
+			assert.Equalf(t, tt.want, got, "ListComputeInstances(%v, %v)", tt.ctx, client)
+		})
+	}
+}
+
+func Test_clusterNameFromInstance(t *testing.T) {
+	tests := map[string]struct {
+		instance types.Instance
+		want     string
+	}{
+		"Instance with no tags should return an empty string": {
+			instance: types.Instance{},
+			want:     "",
+		},
+		"Instance with a tag should return the cluster name": {
+			instance: types.Instance{
+				Tags: []types.Tag{
+					{
+						Key:   aws.String("cluster"),
+						Value: aws.String("cluster-name"),
+					},
+				},
+			},
+			want: "cluster-name",
+		},
+		"Instance with eks:clustername should return the cluster name": {
+			instance: types.Instance{
+				Tags: []types.Tag{
+					{
+						Key:   aws.String("eks:cluster-name"),
+						Value: aws.String("cluster-name"),
+					},
+				},
+			},
+			want: "cluster-name",
+		},
+		"Instance with aws:eks:cluster-name should return the cluster name": {
+			instance: types.Instance{
+				Tags: []types.Tag{
+					{
+						Key:   aws.String("eks:cluster-name"),
+						Value: aws.String("cluster-name"),
+					},
+				},
+			},
+			want: "cluster-name",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, ClusterNameFromInstance(tt.instance), "ClusterNameFromInstance(%v)", tt.instance)
+		})
+	}
+}
+
+func TestListEBSVolumes(t *testing.T) {
+	tests := map[string]struct {
+		DescribeVolumes func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error)
+		err             error
+		expected        []types.Volume
+		expectedCalls   int
+	}{
+		"no volumes should return empty": {
+			DescribeVolumes: func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+				return &ec2.DescribeVolumesOutput{}, nil
+			},
+			expectedCalls: 1,
+		},
+		"ensure errors propagate": {
+			DescribeVolumes: func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+				return nil, assert.AnError
+			},
+			err:           assert.AnError,
+			expectedCalls: 1,
+		},
+		"returns volumes": {
+			DescribeVolumes: func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+				return &ec2.DescribeVolumesOutput{
+					Volumes: []types.Volume{
+						{
+							VolumeId: aws.String("vol-111111111"),
+						},
+					},
+				}, nil
+			},
+			expected: []types.Volume{
+				{
+					VolumeId: aws.String("vol-111111111"),
+				},
+			},
+			expectedCalls: 1,
+		},
+		"paginator iterates over pages": {
+			DescribeVolumes: func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+				if e.NextToken == nil {
+					return &ec2.DescribeVolumesOutput{
+						NextToken: aws.String("token"),
+						Volumes: []types.Volume{
+							{
+								VolumeId: aws.String("vol-111111111"),
+							},
+						},
+					}, nil
+				}
+				return &ec2.DescribeVolumesOutput{
+					Volumes: []types.Volume{
+						{
+							VolumeId: aws.String("vol-2222222222"),
+						},
+					},
+				}, nil
+			},
+			expected: []types.Volume{
+				{
+					VolumeId: aws.String("vol-111111111"),
+				},
+				{
+					VolumeId: aws.String("vol-2222222222"),
+				},
+			},
+			expectedCalls: 2,
+		},
+		"includes volumes created from snapshots": {
+			DescribeVolumes: func(ctx context.Context, e *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error) {
+				for _, filter := range e.Filters {
+					if filter.Name != nil && *filter.Name == "snapshot-id" {
+						t.Errorf("snapshot-id filter should not be applied, as it excludes volumes created from snapshots")
+					}
+				}
+				return &ec2.DescribeVolumesOutput{
+					Volumes: []types.Volume{
+						{
+							VolumeId:   aws.String("vol-no-snapshot"),
+							SnapshotId: aws.String(""),
+						},
+						{
+							VolumeId:   aws.String("vol-from-snapshot"),
+							SnapshotId: aws.String("snap-1234567890abcdef0"),
+						},
+					},
+				}, nil
+			},
+			expected: []types.Volume{
+				{
+					VolumeId:   aws.String("vol-no-snapshot"),
+					SnapshotId: aws.String(""),
+				},
+				{
+					VolumeId:   aws.String("vol-from-snapshot"),
+					SnapshotId: aws.String("snap-1234567890abcdef0"),
+				},
+			},
+			expectedCalls: 1,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			client := mocks.NewMockEC2(ctrl)
+			client.EXPECT().
+				DescribeVolumes(gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(tt.DescribeVolumes).
+				Times(tt.expectedCalls)
+			ctx := t.Context()
+
+			c := newCompute(client)
+			resp, err := c.listEBSVolumes(ctx)
+			assert.Equal(t, tt.err, err)
+			assert.Equal(t, tt.expected, resp)
+		})
+	}
+}
+
+func TestNameFromVolume(t *testing.T) {
+	tests := map[string]struct {
+		volume   types.Volume
+		expected string
+	}{
+		"no tags returns empty string": {
+			volume:   types.Volume{},
+			expected: "",
+		},
+		"tags exist but not the pv name one": {
+			volume: types.Volume{
+				Tags: []types.Tag{
+					{
+						Key:   aws.String("asdf"),
+						Value: aws.String("asdf"),
+					},
+				},
+			},
+			expected: "",
+		},
+		"tags slice contains the tag for the pv name eks adds to PVs": {
+			volume: types.Volume{
+				Tags: []types.Tag{
+					{
+						Key:   aws.String(eksPVTagName),
+						Value: aws.String("pvc-1234567890"),
+					},
+				},
+			},
+			expected: "pvc-1234567890",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, NameFromVolume(tt.volume))
+		})
+	}
+}
+
+func TestListActiveCapacityReservations(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	client := mocks.NewMockEC2(ctrl)
+
+	page1 := &ec2.DescribeCapacityReservationsOutput{
+		CapacityReservations: []types.CapacityReservation{
+			{CapacityReservationId: aws.String("cr-block-1"), ReservationType: types.CapacityReservationTypeCapacityBlock, InstanceType: aws.String("p5.48xlarge")},
+			{CapacityReservationId: aws.String("cr-default"), ReservationType: types.CapacityReservationTypeDefault, InstanceType: aws.String("m7i.large")},
+		},
+		NextToken: aws.String("page2"),
+	}
+	page2 := &ec2.DescribeCapacityReservationsOutput{
+		CapacityReservations: []types.CapacityReservation{
+			{CapacityReservationId: aws.String("cr-block-2"), ReservationType: types.CapacityReservationTypeCapacityBlock, InstanceType: aws.String("p5e.48xlarge")},
+		},
+	}
+
+	client.EXPECT().
+		DescribeCapacityReservations(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, in *ec2.DescribeCapacityReservationsInput, _ ...func(*ec2.Options)) (*ec2.DescribeCapacityReservationsOutput, error) {
+			// The active-state filter is always applied server-side.
+			assert.True(t, hasStateFilter(in.Filters, "active"), "expected state=active filter")
+			if in.NextToken == nil {
+				return page1, nil
+			}
+			return page2, nil
+		}).
+		Times(2)
+
+	c := newCompute(client)
+	got, err := c.listActiveCapacityReservations(t.Context())
+	assert.NoError(t, err)
+
+	// Only the capacity-block reservations survive; the default RI is dropped.
+	var ids []string
+	for _, cr := range got {
+		ids = append(ids, *cr.CapacityReservationId)
+	}
+	assert.Equal(t, []string{"cr-block-1", "cr-block-2"}, ids)
+}
+
+func hasStateFilter(filters []types.Filter, state string) bool {
+	for _, f := range filters {
+		if f.Name != nil && *f.Name == "state" {
+			for _, v := range f.Values {
+				if v == state {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

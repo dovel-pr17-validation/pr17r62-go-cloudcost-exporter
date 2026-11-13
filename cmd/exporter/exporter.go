@@ -1,0 +1,373 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/pprof"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/collectors/version"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	cversion "github.com/prometheus/common/version"
+
+	cloudcost_exporter "github.com/grafana/cloudcost-exporter"
+	"github.com/grafana/cloudcost-exporter/cmd/exporter/config"
+	"github.com/grafana/cloudcost-exporter/cmd/exporter/web"
+	"github.com/grafana/cloudcost-exporter/pkg/aws"
+	"github.com/grafana/cloudcost-exporter/pkg/azure"
+	"github.com/grafana/cloudcost-exporter/pkg/google"
+	"github.com/grafana/cloudcost-exporter/pkg/logger"
+	"github.com/grafana/cloudcost-exporter/pkg/provider"
+)
+
+func main() {
+	var cfg config.Config
+	providerFlags(flag.CommandLine, &cfg)
+	operationalFlags(&cfg)
+	flag.Parse()
+
+	if cfg.ListServices {
+		printAvailableServices(os.Stdout)
+		return
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	logs := setupLogger(cfg.LoggerOpts.Level, cfg.LoggerOpts.Output, cfg.LoggerOpts.Type)
+	logs.LogAttrs(ctx, slog.LevelInfo, "Starting cloudcost-exporter",
+		slog.String("version", cversion.Info()),
+		slog.String("build_context", cversion.BuildContext()),
+	)
+	cfg.Logger = logs
+
+	if cfg.Providers.GCP.BucketProjectsDeprecated {
+		logs.LogAttrs(ctx, slog.LevelWarn, "'gcp.bucket-projects' is deprecated and will be removed in a future version. Use '--gcp.projects' instead.")
+	}
+
+	csp, err := selectProvider(ctx, &cfg)
+	if err != nil {
+		logs.LogAttrs(ctx, slog.LevelError, "Error selecting provider",
+			slog.String("message", err.Error()),
+			slog.String("provider", cfg.Provider),
+		)
+		os.Exit(1)
+	}
+
+	err = runServer(ctx, &cfg, csp, logs)
+	if err != nil {
+		logs.LogAttrs(ctx, slog.LevelError, "Error running server", slog.String("message", err.Error()))
+		os.Exit(1)
+	}
+}
+
+// providerFlags is a helper method that is responsible for setting up the flags that are used to configure the provider.
+// TODO: This should probably be moved over to the config package.
+func providerFlags(fs *flag.FlagSet, cfg *config.Config) {
+	flag.StringVar(&cfg.Provider, "provider", "aws", "aws, gcp, or azure")
+	fs.StringVar(&cfg.Providers.AWS.Profile, "aws.profile", "", "AWS Profile to authenticate with.")
+	fs.Var(&cfg.Providers.GCP.Projects, "gcp.projects", "GCP project(s).")
+	fs.Var(config.NewDeprecatedStringSliceFlag(&cfg.Providers.GCP.Projects, &cfg.Providers.GCP.BucketProjectsDeprecated), "gcp.bucket-projects", "GCP project(s). (deprecated: use --gcp.projects instead)")
+	fs.Var(&cfg.Providers.AWS.Services, "aws.services", "AWS service(s). Run with -list-services to see available values.")
+	fs.Var(&cfg.Providers.AWS.ExperimentalServices, "aws.experimental.services", "Experimental AWS service(s); their metrics are not covered by the backward-compatibility contract and may change. Run with -list-services to see available values.")
+	fs.Var(&cfg.Providers.AWS.ExcludeRegions, "aws.exclude-regions", "AWS region(s) to exclude from cost collection.")
+	fs.Var(&cfg.Providers.Azure.Services, "azure.services", "Azure service(s) (comma-separated and/or repeat flag; case-insensitive). Run with -list-services to see available values.")
+	fs.Var(&cfg.Providers.Azure.ExperimentalServices, "azure.experimental.services", "Experimental Azure service(s); their metrics are not covered by the backward-compatibility contract and may change. Run with -list-services to see available values.")
+	fs.Var(&cfg.Providers.GCP.Services, "gcp.services", "GCP service(s). Run with -list-services to see available values.")
+	fs.Var(&cfg.Providers.GCP.ExperimentalServices, "gcp.experimental.services", "Experimental GCP service(s); their metrics are not covered by the backward-compatibility contract and may change. Run with -list-services to see available values.")
+	fs.StringVar(&cfg.Providers.GCP.VertexFamilyFilter, "gcp.vertex.families", ".*", "Regex matched against the Vertex model family label. Only matching families are emitted.")
+	flag.StringVar(&cfg.Providers.AWS.Region, "aws.region", "", "AWS region")
+	flag.StringVar(&cfg.Providers.AWS.RoleARN, "aws.roleARN", "", "Optional AWS role ARN to assume for cross-account access.")
+	fs.StringVar(&cfg.Providers.AWS.BedrockFamilyFilter, "aws.bedrock.families", ".*", "Regex matched against the Bedrock model family label. Only matching families are emitted.")
+	flag.DurationVar(&cfg.Providers.AWS.RDSRegionListTimeout, "aws.rds.region-timeout", 0, "Per-region timeout for the background RDS refresh (listing plus pricing). 0 (default) uses an internal safety ceiling. Set a positive value (e.g. 15s) to fail slow or unreachable regions faster.")
+	fs.BoolVar(&cfg.Providers.AWS.CapacityBlocks, "aws.ec2.capacity-blocks", false, "Price EC2 Capacity Block for ML reservations. Requires ce:GetCostAndUsage on the EC2 role; off by default since it adds Cost Explorer calls and only applies to accounts that purchase Capacity Blocks.")
+	// TODO - PUT PROJECT-ID UNDER GCP
+	flag.StringVar(&cfg.ProjectID, "project-id", "", "Project ID to target.")
+	flag.StringVar(&cfg.Providers.Azure.SubscriptionID, "azure.subscription-id", "", "Azure subscription ID to pull data from.")
+	flag.IntVar(&cfg.Providers.GCP.DefaultGCSDiscount, "gcp.default-discount", 19, "GCP default discount")
+	flag.IntVar(&cfg.Providers.GCP.GKEZoneConcurrency, "gcp.gke.zone-concurrency", 10, "Cap on concurrent API calls per background store populate (node and disk store).")
+	flag.IntVar(&cfg.Providers.GCP.GCEZoneConcurrency, "gcp.gce.zone-concurrency", 10, "Cap on concurrent API calls per background store populate (node store and machine-type lookups).")
+}
+
+// operationalFlags is a helper method that is responsible for setting up the flags that are used to configure the operational aspects of the application.
+// TODO: This should probably be moved over to the config package.
+func operationalFlags(cfg *config.Config) {
+	flag.BoolVar(&cfg.ListServices, "list-services", false, "Print the services available per provider and exit. Does not require credentials.")
+	flag.DurationVar(&cfg.Collector.ScrapeInterval, "scrape-interval", 1*time.Hour, "Scrape interval")
+	flag.DurationVar(&cfg.Collector.Timeout, "collector-interval", 1*time.Minute, "Context timeout for collectors")
+	flag.DurationVar(&cfg.Server.Timeout, "server-timeout", 30*time.Second, "Server timeout")
+	flag.StringVar(&cfg.Server.Address, "server.address", ":8080", "Default address for the server to listen on.")
+	flag.StringVar(&cfg.Server.Path, "server.path", "/metrics", "Default path for the server to listen on.")
+	flag.StringVar(&cfg.LoggerOpts.Level, "log.level", "info", "Log level: debug, info, warn, error")
+	flag.StringVar(&cfg.LoggerOpts.Output, "log.output", "stdout", "Log output stream: stdout, stderr, file")
+	flag.StringVar(&cfg.LoggerOpts.Type, "log.type", "text", "Log type: json, text")
+}
+
+// setupLogger is a helper method that is responsible for creating a structured logger that is used throughout the application.
+// It sets the log level, output, and type of log.
+func setupLogger(level string, output string, logtype string) *slog.Logger {
+	handler := logger.NewLevelHandler(logger.GetLogLevel(level), logger.HandlerForOutput(logtype, logger.WriterForOutput(output)))
+	return slog.New(handler)
+}
+
+// runServer is a helper method that is responsible for starting the metrics server and handling shutdown signals.
+func runServer(ctx context.Context, cfg *config.Config, csp provider.Provider, log *slog.Logger) error {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	mux.HandleFunc("/", web.HomePageHandler(cfg.Server.Path)) // landing page
+
+	registryHandler, err := createPromRegistryHandler(csp, regionFromConfig(cfg), log) // prom metrics handler
+	if err != nil {
+		return err
+	}
+	mux.Handle(cfg.Server.Path, registryHandler) // prom metrics handler (/metrics)
+
+	server := &http.Server{Addr: cfg.Server.Address, Handler: mux}
+	errChan := make(chan error)
+
+	go func() {
+		log.LogAttrs(ctx, slog.LevelInfo, "Starting server",
+			slog.String("address", cfg.Server.Address),
+			slog.String("path", cfg.Server.Path))
+		errChan <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.LogAttrs(ctx, slog.LevelInfo, "Shutting down server")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.Timeout)
+		defer shutdownCancel()
+
+		err := server.Shutdown(shutdownCtx)
+		if err != nil {
+			return fmt.Errorf("error shutting down server: %w", err)
+		}
+	case err := <-errChan:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("error running server: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func regionFromConfig(cfg *config.Config) string {
+	switch cfg.Provider {
+	case "aws":
+		return cfg.Providers.AWS.Region
+	case "gcp":
+		return cfg.Providers.GCP.Region
+	default:
+		// TODO: add region support for Azure (currently has no region in config)
+		return ""
+	}
+}
+
+// promLogger routes promhttp's Gather errors into the exporter's logger.
+// ContinueOnError would otherwise drop them, leaving only the
+// promhttp_metric_handler_errors_total counter.
+type promLogger struct{ logger *slog.Logger }
+
+func (l promLogger) Println(v ...interface{}) {
+	l.logger.Error("error gathering metrics for the scrape", slog.String("message", fmt.Sprint(v...)))
+}
+
+func createPromRegistryHandler(csp provider.Provider, region string, logger *slog.Logger) (http.Handler, error) {
+	var subsystem = "metrics_handler"
+	requestDuration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:                           prometheus.BuildFQName(cloudcost_exporter.ExporterName, subsystem, "request_duration_seconds"),
+			Help:                           "Duration of HTTP requests in seconds for the metrics endpoint",
+			NativeHistogramBucketFactor:    1.1,
+			NativeHistogramMaxBucketNumber: 10,
+			Buckets:                        []float64{1, 2, 5, 7, 10, 20, 40, 80},
+			ConstLabels:                    prometheus.Labels{"region": region},
+		},
+		[]string{"method"},
+	)
+
+	requestCounter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        prometheus.BuildFQName(cloudcost_exporter.ExporterName, subsystem, "requests_total"),
+			Help:        "Total number of HTTP requests for the metrics endpoint",
+			ConstLabels: prometheus.Labels{"region": region},
+		},
+		[]string{"code", "method"},
+	)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewBuildInfoCollector(),
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		version.NewCollector(cloudcost_exporter.ExporterName),
+		csp,
+		requestCounter,
+		requestDuration,
+	)
+	err := csp.RegisterCollectors(registry)
+	if err != nil {
+		return nil, err
+	}
+
+	handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		EnableOpenMetrics: true,
+		// Serve whatever gathered rather than failing the whole scrape. The
+		// default, HTTPErrorOnError, answers 500 when any single collector
+		// errors during Gather, losing every other collector's metrics and
+		// showing up as up=0. A duplicate metric family from one collector is
+		// a documented cause; see the Scrape Availability runbook.
+		ErrorHandling: promhttp.ContinueOnError,
+		// Registry exposes promhttp_metric_handler_errors_total, so a partial
+		// scrape stays visible rather than silently succeeding.
+		Registry: registry,
+		ErrorLog: promLogger{logger: logger},
+	})
+
+	return promhttp.InstrumentHandlerDuration(
+		requestDuration,
+		promhttp.InstrumentHandlerCounter(
+			requestCounter,
+			handler,
+		),
+	), nil
+}
+
+func selectProvider(ctx context.Context, cfg *config.Config) (provider.Provider, error) {
+	return selectProviderWith(ctx, cfg,
+		func(ctx context.Context, cfg *aws.Config) (provider.Provider, error) { return aws.New(ctx, cfg) },
+		func(ctx context.Context, cfg *azure.Config) (provider.Provider, error) { return azure.New(ctx, cfg) },
+		func(ctx context.Context, cfg *google.Config) (provider.Provider, error) { return google.New(ctx, cfg) },
+	)
+}
+
+type newProviderFunc[T any] func(context.Context, T) (provider.Provider, error)
+
+func selectProviderWith(
+	ctx context.Context,
+	cfg *config.Config,
+	newAWS newProviderFunc[*aws.Config],
+	newAzure newProviderFunc[*azure.Config],
+	newGCP newProviderFunc[*google.Config],
+) (provider.Provider, error) {
+	// Set collector timeout with 1 minute default
+	collectorTimeout := cfg.Collector.Timeout
+	if collectorTimeout == 0 {
+		collectorTimeout = 1 * time.Minute
+	}
+
+	switch cfg.Provider {
+	case "azure":
+		return newAzure(ctx, &azure.Config{
+			Logger:               cfg.Logger,
+			SubscriptionID:       cfg.Providers.Azure.SubscriptionID,
+			ScrapeInterval:       cfg.Collector.ScrapeInterval,
+			Services:             strings.Split(cfg.Providers.Azure.Services.String(), ","),
+			ExperimentalServices: strings.Split(cfg.Providers.Azure.ExperimentalServices.String(), ","),
+			CollectorTimeout:     collectorTimeout,
+		})
+	case "aws":
+		return newAWS(ctx, &aws.Config{
+			Logger:                cfg.Logger,
+			Region:                cfg.Providers.AWS.Region,
+			Profile:               cfg.Providers.AWS.Profile,
+			RoleARN:               cfg.Providers.AWS.RoleARN,
+			ScrapeInterval:        cfg.Collector.ScrapeInterval,
+			Services:              strings.Split(cfg.Providers.AWS.Services.String(), ","),
+			ExperimentalServices:  strings.Split(cfg.Providers.AWS.ExperimentalServices.String(), ","),
+			ExcludeRegions:        strings.Split(cfg.Providers.AWS.ExcludeRegions.String(), ","),
+			CollectorTimeout:      collectorTimeout,
+			BedrockFamilyFilter:   cfg.Providers.AWS.BedrockFamilyFilter,
+			RDSRegionListTimeout:  cfg.Providers.AWS.RDSRegionListTimeout,
+			CapacityBlocksEnabled: cfg.Providers.AWS.CapacityBlocks,
+		})
+
+	case "gcp":
+		return newGCP(ctx, &google.Config{
+			Logger:               cfg.Logger,
+			ProjectId:            cfg.ProjectID,
+			Region:               cfg.Providers.GCP.Region,
+			Projects:             cfg.Providers.GCP.Projects.String(),
+			DefaultDiscount:      cfg.Providers.GCP.DefaultGCSDiscount,
+			ScrapeInterval:       cfg.Collector.ScrapeInterval,
+			Services:             strings.Split(cfg.Providers.GCP.Services.String(), ","),
+			ExperimentalServices: strings.Split(cfg.Providers.GCP.ExperimentalServices.String(), ","),
+			CollectorTimeout:     collectorTimeout,
+			GKEZoneConcurrency:   cfg.Providers.GCP.GKEZoneConcurrency,
+			GCEZoneConcurrency:   cfg.Providers.GCP.GCEZoneConcurrency,
+			VertexFamilyFilter:   cfg.Providers.GCP.VertexFamilyFilter,
+		})
+
+	default:
+		return nil, fmt.Errorf("unknown provider")
+	}
+}
+
+// printAvailableServices writes a human-readable summary of every collector
+// each provider supports, plus a ready-to-run example command per provider.
+// It does not initialize any provider and does not require credentials.
+func printAvailableServices(w io.Writer) {
+	groups := []struct {
+		label    string
+		flag     string
+		services []provider.ServiceInfo
+		example  string
+	}{
+		{
+			label:    "GCP",
+			flag:     "-gcp.services",
+			services: google.Services(),
+			example:  "cloudcost-exporter -provider gcp -gcp.projects <project> -gcp.services GKE,GCS",
+		},
+		{
+			label:    "AWS",
+			flag:     "-aws.services",
+			services: aws.Services(),
+			example:  "cloudcost-exporter -provider aws -aws.region <region> -aws.services EC2,S3",
+		},
+		{
+			label:    "Azure",
+			flag:     "-azure.services",
+			services: azure.Services(),
+			example:  "cloudcost-exporter -provider azure -azure.subscription-id <id> -azure.services AKS",
+		},
+	}
+
+	for i, g := range groups {
+		if i > 0 {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "%s services (%s):\n", g.label, g.flag)
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for _, s := range g.services {
+			name := s.Name
+			if len(s.Aliases) > 0 {
+				name = fmt.Sprintf("%s (alias: %s)", s.Name, strings.Join(s.Aliases, ", "))
+			}
+			desc := s.Description
+			if s.DisplayName != "" && !strings.EqualFold(s.DisplayName, s.Name) {
+				desc = fmt.Sprintf("%s: %s", s.DisplayName, s.Description)
+			}
+			fmt.Fprintf(tw, "  %s\t%s\n", name, desc)
+		}
+		_ = tw.Flush()
+		fmt.Fprintf(w, "\n  Example: %s\n", g.example)
+	}
+}

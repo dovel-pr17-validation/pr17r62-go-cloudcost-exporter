@@ -1,0 +1,24 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ce:*",
+                "ec2:DescribeAddresses",
+                "ec2:DescribeCapacityReservations",
+                "ec2:DescribeInstances",
+                "ec2:DescribeRegions",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:DescribeTransitGateways",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeVpcEndpoints",
+                "elasticloadbalancing:DescribeLoadBalancers",
+                "kafka:ListClustersV2",
+                "pricing:GetProducts",
+                "rds:DescribeDBInstances"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

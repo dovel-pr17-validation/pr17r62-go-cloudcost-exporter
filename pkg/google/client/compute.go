@@ -1,0 +1,122 @@
+package client
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"google.golang.org/api/compute/v1"
+)
+
+var ErrListInstances = errors.New("no list price was found for the sku")
+
+// ErrNilMachineType indicates the Compute Engine API returned a nil machine
+// type alongside a nil error.
+var ErrNilMachineType = errors.New("machine type response was nil")
+
+// ErrIncompleteMachineType indicates the Compute Engine API returned a
+// machine type with a non-positive vCPU or memory value.
+var ErrIncompleteMachineType = errors.New("machine type response has non-positive vCPU or memory")
+
+type Compute struct {
+	computeService *compute.Service
+}
+
+func newCompute(computeService *compute.Service) *Compute {
+	return &Compute{
+		computeService: computeService,
+	}
+}
+
+func (c *Compute) getZones(project string) ([]*compute.Zone, error) {
+	zones, err := c.computeService.Zones.List(project).Do()
+	if err != nil {
+		return nil, err
+	}
+	return zones.Items, nil
+}
+
+func (c *Compute) getRegions(project string) ([]*compute.Region, error) {
+	if c.computeService == nil {
+		return nil, fmt.Errorf("compute service not initialized")
+	}
+	regions, err := c.computeService.Regions.List(project).Do()
+	if err != nil {
+		return nil, err
+	}
+	return regions.Items, nil
+}
+
+func (c *Compute) listInstancesInZone(projectId, zone string) ([]*MachineSpec, error) {
+	var allInstances []*MachineSpec
+	var nextPageToken string
+
+	for {
+		instances, err := c.computeService.Instances.List(projectId, zone).
+			PageToken(nextPageToken).
+			Do()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrListInstances, err.Error())
+		}
+		for _, instance := range instances.Items {
+			allInstances = append(allInstances, NewMachineSpec(instance))
+		}
+		nextPageToken = instances.NextPageToken
+		if nextPageToken == "" {
+			break
+		}
+	}
+	return allInstances, nil
+}
+
+// getMachineType returns the machine type spec (vCPU count, memory) for a
+// (project, zone, machineType) tuple. The spec is immutable for a given
+// zone, so callers should cache the result. Returns ErrNilMachineType or
+// ErrIncompleteMachineType if the API response doesn't have a usable spec.
+func (c *Compute) getMachineType(ctx context.Context, project, zone, machineType string) (*compute.MachineType, error) {
+	mt, err := c.computeService.MachineTypes.Get(project, zone, machineType).Context(ctx).Do()
+	if err != nil {
+		return nil, err
+	}
+	if mt == nil {
+		return nil, ErrNilMachineType
+	}
+	if mt.GuestCpus <= 0 || mt.MemoryMb <= 0 {
+		return nil, ErrIncompleteMachineType
+	}
+	return mt, nil
+}
+
+// listDisks will list all disks in a given zone and return a slice of compute.Disk
+func (c *Compute) listDisks(ctx context.Context, project string, zone string) ([]*compute.Disk, error) {
+	var disks []*compute.Disk
+	// TODO: How do we get this to work for multi regional disks?
+	err := c.computeService.Disks.List(project, zone).Pages(ctx, func(page *compute.DiskList) error {
+		if page == nil {
+			return nil
+		}
+		disks = append(disks, page.Items...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return disks, nil
+}
+
+func (c *Compute) listForwardingRules(ctx context.Context, project string, region string) ([]*compute.ForwardingRule, error) {
+	var forwardingRules []*compute.ForwardingRule
+
+	err := c.computeService.ForwardingRules.List(project, region).Pages(ctx, func(page *compute.ForwardingRuleList) error {
+		if page == nil {
+			return nil
+		}
+		forwardingRules = append(forwardingRules, page.Items...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return forwardingRules, nil
+}

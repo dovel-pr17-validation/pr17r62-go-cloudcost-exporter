@@ -1,0 +1,235 @@
+package vpc
+
+import (
+	"context"
+	"io"
+	"os"
+	"testing"
+	"time"
+
+	"log/slog"
+
+	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	elbv2Types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+	msktypes "github.com/aws/aws-sdk-go-v2/service/kafka/types"
+	pricingTypes "github.com/aws/aws-sdk-go-v2/service/pricing/types"
+	rdsTypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	awsclient "github.com/grafana/cloudcost-exporter/pkg/aws/client"
+	"github.com/grafana/cloudcost-exporter/pkg/utils"
+)
+
+// MockClient for testing
+type MockClient struct {
+	mock.Mock
+}
+
+func (m *MockClient) GetBillingData(ctx context.Context, startDate, endDate time.Time) (*awsclient.BillingData, error) {
+	args := m.Called(ctx, startDate, endDate)
+	return args.Get(0).(*awsclient.BillingData), args.Error(1)
+}
+
+func (m *MockClient) GetCapacityBlockCosts(ctx context.Context, startDate, endDate time.Time) (*awsclient.CapacityBlockCosts, error) {
+	args := m.Called(ctx, startDate, endDate)
+	return args.Get(0).(*awsclient.CapacityBlockCosts), args.Error(1)
+}
+
+func (m *MockClient) DescribeRegions(ctx context.Context, allRegions bool) ([]ec2Types.Region, error) {
+	args := m.Called(ctx, allRegions)
+	return args.Get(0).([]ec2Types.Region), args.Error(1)
+}
+
+func (m *MockClient) ListComputeInstances(ctx context.Context) ([]ec2Types.Reservation, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]ec2Types.Reservation), args.Error(1)
+}
+
+func (m *MockClient) ListActiveCapacityReservations(ctx context.Context) ([]ec2Types.CapacityReservation, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]ec2Types.CapacityReservation), args.Error(1)
+}
+
+func (m *MockClient) ListEBSVolumes(ctx context.Context) ([]ec2Types.Volume, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]ec2Types.Volume), args.Error(1)
+}
+
+func (m *MockClient) ListSpotPrices(ctx context.Context) ([]ec2Types.SpotPrice, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]ec2Types.SpotPrice), args.Error(1)
+}
+
+func (m *MockClient) ListOnDemandPrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListStoragePrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListEC2ServicePrices(ctx context.Context, region string, filters []pricingTypes.Filter) ([]string, error) {
+	args := m.Called(ctx, region, filters)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListVPCServicePrices(ctx context.Context, region string, filters []pricingTypes.Filter) ([]string, error) {
+	args := m.Called(ctx, region, filters)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListELBPrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) DescribeLoadBalancers(ctx context.Context) ([]elbv2Types.LoadBalancer, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]elbv2Types.LoadBalancer), args.Error(1)
+}
+
+func (m *MockClient) ListRDSInstances(ctx context.Context) ([]rdsTypes.DBInstance, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]rdsTypes.DBInstance), args.Error(1)
+}
+
+func (m *MockClient) ListRDSPrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListMSKClusters(ctx context.Context) ([]msktypes.Cluster, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]msktypes.Cluster), args.Error(1)
+}
+
+func (m *MockClient) ListMSKServicePrices(ctx context.Context, region string, filters []pricingTypes.Filter) ([]string, error) {
+	args := m.Called(ctx, region, filters)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListBedrockPrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) ListBedrockMarketplacePrices(ctx context.Context, region string) ([]string, error) {
+	args := m.Called(ctx, region)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *MockClient) Metrics() []prometheus.Collector {
+	args := m.Called()
+	return args.Get(0).([]prometheus.Collector)
+}
+
+func TestNew(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	mockClient := &MockClient{}
+
+	// Set up mock expectations for VPC pricing calls
+	mockClient.On("ListVPCServicePrices", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return([]string{
+		`{"product":{"attributes":{"usagetype":"USE1-VpcEndpoint-Hours","regionCode":"us-east-1"}},"terms":{"OnDemand":{"test":{"priceDimensions":{"test":{"pricePerUnit":{"USD":"0.01"}}}}}}}`,
+		`{"product":{"attributes":{"usagetype":"USE1-TransitGateway-Hours","regionCode":"us-east-1"}},"terms":{"OnDemand":{"test":{"priceDimensions":{"test":{"pricePerUnit":{"USD":"0.05"}}}}}}}`,
+		`{"product":{"attributes":{"usagetype":"USE1-PublicIPv4:InUseAddress","regionCode":"us-east-1"}},"terms":{"OnDemand":{"test":{"priceDimensions":{"test":{"pricePerUnit":{"USD":"0.005"}}}}}}}`,
+	}, nil)
+
+	regions := []ec2Types.Region{
+		{RegionName: utils.StringPtr("us-east-1")},
+		{RegionName: utils.StringPtr("us-west-2")},
+	}
+
+	collector, err := New(t.Context(), &Config{
+		ScrapeInterval: 1 * time.Hour,
+		Regions:        regions,
+		Client:         mockClient, // Add the dedicated client
+		AccountID:      "123456789012",
+	}, logger)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, collector)
+	assert.NotNil(t, collector.pricingMap)
+}
+
+func TestCollectorName(t *testing.T) {
+	collector := &Collector{}
+	assert.Equal(t, "VPC", collector.Name())
+}
+
+func TestDescribe(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	collector := &Collector{logger: logger}
+
+	ch := make(chan *prometheus.Desc, 10)
+
+	err := collector.Describe(ch)
+	assert.NoError(t, err)
+}
+
+func TestCollect_EmitsMetrics(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	mockClient := &MockClient{}
+
+	products := []string{
+		`{"product":{"attributes":{"usageType":"USE1-VpcEndpoint-Hours","regionCode":"us-east-1"}},"terms":{"OnDemand":{"t1":{"priceDimensions":{"d1":{"pricePerUnit":{"USD":"0.01"}}}}}}}`,
+		`{"product":{"attributes":{"usageType":"USE1-VpcEndpoint-Service-Hours","regionCode":"us-east-1"}},"terms":{"OnDemand":{"t1":{"priceDimensions":{"d1":{"pricePerUnit":{"USD":"0.01"}}}}}}}`,
+		`{"product":{"attributes":{"usageType":"USE1-TransitGateway-Hours","regionCode":"us-east-1"}},"terms":{"OnDemand":{"t1":{"priceDimensions":{"d1":{"pricePerUnit":{"USD":"0.05"}}}}}}}`,
+		`{"product":{"attributes":{"usageType":"USE1-PublicIPv4:InUseAddress","regionCode":"us-east-1"}},"terms":{"OnDemand":{"t1":{"priceDimensions":{"d1":{"pricePerUnit":{"USD":"0.005"}}}}}}}`,
+		`{"product":{"attributes":{"usageType":"USE1-PublicIPv4:IdleAddress","regionCode":"us-east-1"}},"terms":{"OnDemand":{"t1":{"priceDimensions":{"d1":{"pricePerUnit":{"USD":"0.003"}}}}}}}`,
+	}
+	mockClient.On("ListVPCServicePrices", mock.Anything, mock.AnythingOfType("string"), mock.Anything).Return(products, nil)
+
+	collector, err := New(t.Context(), &Config{
+		ScrapeInterval: time.Hour,
+		Regions:        []ec2Types.Region{{RegionName: utils.StringPtr("us-east-1")}},
+		Client:         mockClient,
+		AccountID:      "123456789012",
+	}, logger)
+	require.NoError(t, err)
+
+	ch := make(chan prometheus.Metric, 10)
+	err = collector.Collect(t.Context(), ch)
+	close(ch)
+
+	require.NoError(t, err)
+
+	var metrics []prometheus.Metric
+	for m := range ch {
+		metrics = append(metrics, m)
+	}
+	// One metric per rate type: VPC endpoint, VPC service endpoint, Transit Gateway, EIP in-use, EIP idle
+	assert.Len(t, metrics, 5)
+}
+
+// Test that VPC pricing map methods return errors when no data is available
+func TestVPCPricingMapErrors(t *testing.T) {
+	// Use a logger that discards output to reduce test noise
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pricingMap := NewVPCPricingMap(logger)
+
+	// Test error values when no pricing data is available
+	_, err := pricingMap.GetVPCEndpointHourlyRate("us-east-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get standard VPC endpoint pricing for region us-east-1")
+
+	_, err = pricingMap.GetVPCServiceEndpointHourlyRate("us-east-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get VPC service endpoint pricing for region us-east-1")
+
+	_, err = pricingMap.GetTransitGatewayHourlyRate("us-east-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get Transit Gateway pricing for region us-east-1")
+
+	_, err = pricingMap.GetElasticIPInUseRate("us-east-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get Elastic IP in-use pricing for region us-east-1")
+
+	_, err = pricingMap.GetElasticIPIdleRate("us-east-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get Elastic IP idle pricing for region us-east-1")
+}

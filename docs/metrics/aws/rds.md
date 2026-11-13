@@ -1,0 +1,86 @@
+# AWS RDS Metrics
+
+| Metric name                                    | Metric type | Description                                                                          | Labels                                                                                                                                              |
+|------------------------------------------------|-------------|--------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| cloudcost_aws_rds_hourly_rate_usd_per_hour     | Gauge       | Hourly cost of AWS RDS instances by region, tier, and instance ID. Cost represented in USD/hour | `account_id`=&lt;AWS account ID&gt; <br/> `region`=&lt;AWS region&gt; <br/> `tier`=&lt;RDS instance tier&gt; <br/> `id`=&lt;RDS instance ID&gt; <br/> `arn_name`=&lt;RDS instance ARN name&gt; |
+
+### Operational Metrics
+
+| Metric name                                      | Metric type | Description                                                              | Labels                                                                                                                              |
+|--------------------------------------------------|-------------|-------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| cloudcost_exporter_aws_rds_populate_errors_total | Counter     | Errors during background store population by store, region, and operation | `store`=&lt;`instances` or `pricing`&gt; <br/> `region`=&lt;AWS region&gt; <br/> `operation`=&lt;`lookup_client`, `list_instances`, `list_prices`, `parse_pricing`&gt; |
+
+## Overview
+
+The RDS collector exports pricing metrics for Amazon Relational Database Service instances across all configured AWS regions. It collects hourly pricing rates for RDS database instances based on their instance type and tier.
+
+## Configuration
+
+Enable the RDS collector by adding `rds` to your AWS services configuration:
+
+```yaml
+aws:
+  services: ["ec2", "s3", "rds"]
+  regions: ["us-east-1", "us-west-2"]
+```
+
+Or via command line:
+```bash
+--aws.services=ec2,s3,rds
+```
+
+### Per-region Timeout
+
+Instance inventory (`DescribeDBInstances`) and pricing (`GetProducts`) refresh independently, each in its own background store with its own per-region call. `--aws.rds.region-timeout` bounds each region's work in both stores:
+
+```bash
+--aws.rds.region-timeout=15s
+```
+
+The default is `0`, which applies an internal safety ceiling so a hung AWS call can never stall either background refresh. Set a positive value (e.g. `15s`) to fail slow or unreachable regions faster: the region is logged, counted in `cloudcost_exporter_aws_rds_populate_errors_total`, and skipped while the others still warm. Because the refresh runs off the scrape path, a slow region delays only the freshness of that region's data, not the scrape itself.
+
+## Labels
+
+- **account_id**: The AWS account ID (12-digit), resolved via STS GetCallerIdentity
+- **region**: The AWS region where the RDS instance is running
+- **tier**: The pricing tier of the RDS instance (e.g., on-demand, reserved)
+- **id**: The unique identifier of the RDS instance
+- **arn_name**: The Amazon Resource Name (ARN) of the RDS instance
+
+## Notes
+
+- Pricing is listed in bulk per region from the AWS Pricing API and keyed by instance type, engine, deployment option, and license so `Collect` matches each instance to its price
+- Aurora MySQL and Aurora PostgreSQL additionally key on storage mode (Standard vs I/O-Optimized), since I/O-Optimized carries a different instance-hour price. Classes with local instance storage (Aurora PostgreSQL `db.r6gd`, `db.r6id`, `db.r8gd`; Aurora MySQL `db.r3`) list their disk size as the storage of their Standard SKU, and key as Standard. An Aurora instance with an unrecognized or missing storage mode is skipped rather than priced against the wrong SKU
+- Instances whose engine is not recognized are skipped; recognized engines are MySQL, MariaDB, PostgreSQL, Aurora MySQL, Aurora PostgreSQL, Oracle, and SQL Server
+- RDS Custom SKUs are ignored, and not counted as parse errors: RDS Custom instances use their own engines (`custom-oracle-ee`, ...), and RDS Custom for Oracle SKUs would otherwise overwrite the standard RDS Oracle price for the same instance type and license
+- Aurora Serverless v2 (`db.serverless`) instances are not priced: AWS bills them per ACU-hour under a separate `ServerlessV2` product family, not per instance-hour
+- Instance inventory and pricing refresh independently in the background, each in its own store: inventory refreshes on `--scrape-interval` (default `1h`); pricing refreshes on a fixed 24-hour interval, since it's a stable bulk-per-region fetch that doesn't need frequent refresh
+- Scrapes read both warm stores and make no AWS calls
+- No metrics emit until both the instance and pricing background stores complete their first refresh after startup
+- All costs are represented in USD per hour
+
+## IAM Permissions
+
+Required permissions for RDS metrics collection:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "rds:DescribeDBInstances"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "pricing:GetProducts"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```

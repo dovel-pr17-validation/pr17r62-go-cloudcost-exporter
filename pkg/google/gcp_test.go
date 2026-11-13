@@ -1,0 +1,268 @@
+package google
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/grafana/cloudcost-exporter/pkg/provider"
+	mock_provider "github.com/grafana/cloudcost-exporter/pkg/provider/mocks"
+	"github.com/grafana/cloudcost-exporter/pkg/utils"
+)
+
+var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+func Test_RegisterCollectors(t *testing.T) {
+	tests := map[string]struct {
+		numCollectors int
+		register      func(r provider.Registry) error
+		expectedError error
+	}{
+		"no error if no collectors": {},
+		"bubble-up single collector error": {
+			numCollectors: 1,
+			register: func(r provider.Registry) error {
+				return fmt.Errorf("test register error")
+			},
+			expectedError: fmt.Errorf("test register error"),
+		},
+		"two collectors with no errors": {
+			numCollectors: 2,
+			register:      func(r provider.Registry) error { return nil },
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			r := mock_provider.NewMockRegistry(ctrl)
+			r.EXPECT().MustRegister(gomock.Any()).AnyTimes()
+
+			c := mock_provider.NewMockCollector(ctrl)
+			if tt.register != nil {
+				c.EXPECT().Register(r).DoAndReturn(tt.register).Times(tt.numCollectors)
+			}
+			gcp := &GCP{
+				config:           &Config{},
+				collectors:       []provider.Collector{},
+				logger:           logger,
+				ctx:              t.Context(),
+				collectorTimeout: 1 * time.Minute,
+			}
+			for range tt.numCollectors {
+				gcp.collectors = append(gcp.collectors, c)
+			}
+			err := gcp.RegisterCollectors(r)
+			if tt.expectedError != nil {
+				require.EqualError(t, err, tt.expectedError.Error())
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestGCP_CollectConcurrencyLimit(t *testing.T) {
+	// numCollectors is intentionally larger than collectConcurrencyLimit to
+	// exercise the limit.  The mock Collect sleeps briefly so that goroutines
+	// overlap in time; without SetLimit the peak would equal numCollectors.
+	const numCollectors = 25
+
+	var (
+		mu                 sync.Mutex
+		currentConcurrency int
+		peakConcurrency    int
+		totalCalls         int
+	)
+
+	ctrl := gomock.NewController(t)
+	c := mock_provider.NewMockCollector(ctrl)
+	c.EXPECT().Name().Return("concurrent-collector").AnyTimes()
+	c.EXPECT().Register(gomock.Any()).Return(nil).AnyTimes()
+	c.EXPECT().Collect(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ chan<- prometheus.Metric) error {
+			mu.Lock()
+			currentConcurrency++
+			totalCalls++
+			if currentConcurrency > peakConcurrency {
+				peakConcurrency = currentConcurrency
+			}
+			mu.Unlock()
+
+			time.Sleep(10 * time.Millisecond)
+
+			mu.Lock()
+			currentConcurrency--
+			mu.Unlock()
+			return nil
+		},
+	).Times(numCollectors)
+
+	gcp := &GCP{
+		config:           &Config{},
+		collectors:       make([]provider.Collector, numCollectors),
+		logger:           logger,
+		ctx:              t.Context(),
+		collectorTimeout: 1 * time.Minute,
+	}
+	for i := range numCollectors {
+		gcp.collectors[i] = c
+	}
+
+	// Use a buffered channel so goroutines can always send metrics without
+	// blocking (gatherer internals emit a few metrics per collector).
+	ch := make(chan prometheus.Metric, numCollectors*10)
+	gcp.Collect(ch)
+	close(ch)
+
+	assert.Equal(t, numCollectors, totalCalls, "every collector must be called exactly once")
+	assert.LessOrEqual(t, peakConcurrency, collectConcurrencyLimit,
+		"peak concurrency must not exceed collectConcurrencyLimit")
+}
+
+func TestGCP_CollectMetrics(t *testing.T) {
+	tests := map[string]struct {
+		numCollectors   int
+		collectorName   string
+		collect         func(context.Context, chan<- prometheus.Metric) error
+		expectedMetrics []*utils.MetricResult
+	}{
+		"no error if no collectors": {
+			numCollectors:   0,
+			collectorName:   "test1",
+			expectedMetrics: []*utils.MetricResult{},
+		},
+		"bubble-up single collector error": {
+			numCollectors: 1,
+			collectorName: "test2",
+			collect: func(context.Context, chan<- prometheus.Metric) error {
+				return fmt.Errorf("test collect error")
+			},
+			expectedMetrics: []*utils.MetricResult{
+				{
+					FqName:     "cloudcost_exporter_collector_last_scrape_error",
+					Labels:     utils.LabelMap{"provider": "gcp", "collector": "test2"},
+					Value:      1,
+					MetricType: prometheus.CounterValue,
+				},
+			},
+		},
+		"two collectors with no errors": {
+			numCollectors: 2,
+			collectorName: "test3",
+			collect:       func(context.Context, chan<- prometheus.Metric) error { return nil },
+			expectedMetrics: []*utils.MetricResult{
+				{
+					FqName:     "cloudcost_exporter_collector_last_scrape_error",
+					Labels:     utils.LabelMap{"provider": "gcp", "collector": "test3"},
+					Value:      0,
+					MetricType: prometheus.CounterValue,
+				},
+				{
+					FqName:     "cloudcost_exporter_collector_last_scrape_error",
+					Labels:     utils.LabelMap{"provider": "gcp", "collector": "test3"},
+					Value:      0,
+					MetricType: prometheus.CounterValue,
+				},
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ch := make(chan prometheus.Metric)
+
+			ctrl := gomock.NewController(t)
+			c := mock_provider.NewMockCollector(ctrl)
+			registry := mock_provider.NewMockRegistry(ctrl)
+			registry.EXPECT().MustRegister(gomock.Any()).AnyTimes()
+			if tt.collect != nil {
+				c.EXPECT().Name().Return(tt.collectorName).AnyTimes()
+				c.EXPECT().Collect(gomock.Any(), ch).DoAndReturn(tt.collect).AnyTimes()
+				c.EXPECT().Register(gomock.Any()).Return(nil).AnyTimes()
+				c.EXPECT().Describe(gomock.Any()).Return(nil).AnyTimes()
+			}
+			gcp := &GCP{
+				config:           &Config{},
+				collectors:       []provider.Collector{},
+				logger:           logger,
+				ctx:              t.Context(),
+				collectorTimeout: 1 * time.Minute,
+			}
+
+			for range tt.numCollectors {
+				gcp.collectors = append(gcp.collectors, c)
+			}
+
+			wg := sync.WaitGroup{}
+
+			wg.Add(1)
+			go func() {
+				gcp.Collect(ch)
+				close(ch)
+			}()
+			wg.Done()
+
+			wg.Wait()
+			var metrics []*utils.MetricResult
+			var ignoreMetric = func(metricName string) bool {
+				ignoredMetricSuffix := []string{
+					"duration_seconds",
+					"last_scrape_time",
+					"collector_total",
+					"collector_error",
+				}
+				for _, suffix := range ignoredMetricSuffix {
+					if strings.Contains(metricName, suffix) {
+						return true
+					}
+				}
+
+				return false
+			}
+			for m := range ch {
+				metric := utils.ReadMetrics(m)
+				if metric == nil { // ReadMetrics can't parse histograms
+					continue
+				}
+				if ignoreMetric(metric.FqName) {
+					continue
+				}
+				metrics = append(metrics, metric)
+			}
+			assert.ElementsMatch(t, metrics, tt.expectedMetrics)
+		})
+	}
+}
+
+func TestServices(t *testing.T) {
+	got := Services()
+	wantNames := []string{
+		serviceGCS, serviceGKE, serviceGCE, serviceCLB, serviceVPC,
+		serviceSQL, serviceManagedKafka, serviceVertex,
+	}
+	gotNames := make([]string, 0, len(got))
+	for _, s := range got {
+		gotNames = append(gotNames, s.Name)
+		assert.NotEmpty(t, s.DisplayName, "DisplayName empty for %s", s.Name)
+		assert.NotEmpty(t, s.Description, "Description empty for %s", s.Name)
+	}
+	assert.ElementsMatch(t, wantNames, gotNames)
+
+	var kafka provider.ServiceInfo
+	for _, s := range got {
+		if s.Name == serviceManagedKafka {
+			kafka = s
+			break
+		}
+	}
+	assert.Contains(t, kafka.Aliases, serviceKafkaAlias, "MANAGEDKAFKA should carry KAFKA as alias")
+}
